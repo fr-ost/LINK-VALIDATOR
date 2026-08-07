@@ -10,13 +10,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Link Validator")
-
 BASE_DIR = Path(__file__).parent
 
-# ---- Limits -----------------------------------------------------------------
-MAX_LINKS = 500          # hard cap per request
-CONCURRENCY = 20         # links checked in parallel
-HTML_SNIFF_BYTES = 4096  # how much body to read to judge an html page
+MAX_LINKS = 500
+CONCURRENCY = 20
+SNIFF_BYTES = 4096  # bytes read from the start of each link to inspect its content
 
 UA = {
     "User-Agent": (
@@ -26,7 +24,8 @@ UA = {
     "Accept": "*/*",
 }
 
-# Content types that clearly mean "downloadable file", not a viewable page.
+# Content types that count as a real file, used only as a fallback when the
+# magic-byte signature is unknown but the body is clearly not a web page.
 FILE_CT_PREFIXES = ("image/", "video/", "audio/", "font/")
 FILE_CT_EXACT = {
     "application/pdf", "application/zip", "application/x-zip-compressed",
@@ -36,19 +35,8 @@ FILE_CT_EXACT = {
     "application/rtf", "application/x-msdownload", "application/vnd.android.package-archive",
     "application/x-apple-diskimage", "application/epub+zip",
 }
-FILE_CT_CONTAINS = ("vnd.openxmlformats", "vnd.oasis.opendocument", "spreadsheet",
-                    "presentation", "wordprocessing")
-
-# URL path extensions that clearly mean "file".
-FILE_EXTS = {
-    "pdf", "zip", "rar", "7z", "tar", "gz", "tgz", "bz2",
-    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt", "rtf", "md",
-    "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tiff", "heic",
-    "mp4", "mov", "avi", "mkv", "webm", "mp3", "wav", "flac", "ogg", "m4a",
-    "exe", "dmg", "apk", "deb", "rpm", "msi", "iso", "bin",
-    "json", "xml", "yaml", "yml", "sql", "epub", "mobi",
-}
-PAGE_EXTS = {"html", "htm", "php", "asp", "aspx", "jsp", "cfm", ""}
+FILE_CT_CONTAINS = ("vnd.openxmlformats", "vnd.oasis.opendocument",
+                    "spreadsheet", "presentation", "wordprocessing")
 
 
 class CheckRequest(BaseModel):
@@ -69,28 +57,86 @@ def human_size(n):
     return f"{n:.1f} PB"
 
 
-def path_ext(url):
-    path = re.sub(r"[?#].*$", "", url)          # drop query and fragment
-    last = path.rstrip("/").rsplit("/", 1)[-1]
-    if "." in last:
-        return last.rsplit(".", 1)[-1].lower()
-    return ""
+def sniff_filetype(b: bytes):
+    """Return a file-type label if the bytes match a known signature, else None."""
+    if len(b) < 3:
+        return None
+    # Images
+    if b[:3] == b"\xFF\xD8\xFF":
+        return "jpg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if b[:2] == b"BM":
+        return "bmp"
+    if b[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if b[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    if b[4:8] == b"ftyp":
+        brand = b[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"mif1", b"heim", b"heis"):
+            return "heic"
+        if brand == b"avif":
+            return "avif"
+        return "mp4"
+    # Documents / archives
+    if b[:4] == b"%PDF":
+        return "pdf"
+    if b[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return "zip/office"
+    if b[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1a\xE1":
+        return "doc/xls/ppt"
+    if b[:5] == b"{\\rtf":
+        return "rtf"
+    if b[:4] == b"Rar!":
+        return "rar"
+    if b[:6] == b"7z\xBC\xAF\x27\x1C":
+        return "7z"
+    if b[:2] == b"\x1f\x8b":
+        return "gz"
+    # Audio
+    if b[:3] == b"ID3" or b[:2] == b"\xFF\xFB":
+        return "mp3"
+    if b[:4] == b"OggS":
+        return "ogg"
+    if b[:4] == b"fLaC":
+        return "flac"
+    if b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return "wav"
+    return None
 
 
-def is_file(content_type, disposition, ext):
-    if "attachment" in disposition:
+def looks_like_svg(b: bytes, content_type: str):
+    head = b[:2048].lstrip().lower()
+    if b"<svg" in head:
         return True
-    ct = content_type.split(";")[0].strip().lower()
-    if ct in FILE_CT_EXACT:
+    if "svg" in content_type.lower() and b"<svg" in b[:4096].lower():
         return True
+    return False
+
+
+def looks_like_html(b: bytes):
+    head = b[:1024].lstrip().lower()
+    if head.startswith((b"<!doctype html", b"<html", b"<head", b"<!--")):
+        return True
+    if head.startswith(b"<") and b"<html" in head:
+        return True
+    return False
+
+
+def content_type_is_file(ct: str):
+    ct = ct.split(";")[0].strip().lower()
+    if not ct or ct in ("text/html", "application/xhtml+xml"):
+        return False
     if any(ct.startswith(p) for p in FILE_CT_PREFIXES):
         return True
+    if ct in FILE_CT_EXACT:
+        return True
     if any(k in ct for k in FILE_CT_CONTAINS):
-        return True
-    if ext in FILE_EXTS and ext not in ("json", "xml", "yaml", "yml"):
-        return True
-    # data formats: only a file if the URL actually ends in that extension
-    if ext in ("json", "xml", "yaml", "yml"):
         return True
     return False
 
@@ -106,10 +152,8 @@ async def do_check(client, checked_url, base):
     async with client.stream("GET", checked_url, headers=UA) as resp:
         status = resp.status_code
         ct = resp.headers.get("content-type", "")
-        cd = resp.headers.get("content-disposition", "").lower()
         clen = resp.headers.get("content-length")
         final = str(resp.url)
-        ext = path_ext(final)
 
         base.update({
             "http_status": status,
@@ -118,26 +162,46 @@ async def do_check(client, checked_url, base):
             "size": human_size(clen),
         })
 
+        # A real file link should return 2xx/3xx. Errors mean no file.
         if status >= 400:
             base.update({"category": "blank", "reason": f"HTTP {status}"})
             return base
 
-        if is_file(ct, cd, ext):
-            base.update({"category": "file", "file_type": ext or ct.split("/")[-1]})
+        # Read only the first bytes; enough to identify the file, cheap for big files.
+        body = b""
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) >= SNIFF_BYTES:
+                break
+
+        if not body:
+            base.update({"category": "blank", "reason": "Empty response"})
             return base
 
-        # Looks like a page. Read a little to catch truly empty responses.
-        head = b""
-        if "text/html" in ct.lower() or "xhtml" in ct.lower() or ct == "":
-            async for chunk in resp.aiter_bytes():
-                head += chunk
-                if len(head) >= HTML_SNIFF_BYTES:
-                    break
-            if clen == "0" or (not head.strip() and not ct):
-                base.update({"category": "blank", "reason": "Empty response"})
-                return base
+        # 1) Real file signature -> positive.
+        ftype = sniff_filetype(body)
+        if ftype:
+            base.update({"category": "file", "file_type": ftype})
+            return base
 
-        base.update({"category": "website"})
+        # 2) SVG image (text-based, so checked separately) -> positive.
+        if looks_like_svg(body, ct):
+            base.update({"category": "file", "file_type": "svg"})
+            return base
+
+        # 3) A web page / error page in disguise -> no file.
+        if looks_like_html(body):
+            base.update({"category": "blank", "reason": "No file (web page)"})
+            return base
+
+        # 4) Unknown signature but the server clearly serves a binary file.
+        if content_type_is_file(ct):
+            sub = ct.split("/")[-1].split(";")[0].strip()
+            base.update({"category": "file", "file_type": sub or "file"})
+            return base
+
+        # Otherwise there is no downloadable file here.
+        base.update({"category": "blank", "reason": "No file"})
         return base
 
 
@@ -154,10 +218,7 @@ async def check_one(client, insecure, raw, index):
         msg = str(e).lower()
         if "ssl" in msg or "certificate" in msg:
             try:
-                out = await do_check(insecure, checked, base)
-                if not out.get("reason"):
-                    out["reason"] = "Insecure certificate"
-                return out
+                return await do_check(insecure, checked, base)
             except Exception:
                 base["reason"] = "SSL / certificate error"
                 return base
@@ -172,10 +233,7 @@ async def check_one(client, insecure, raw, index):
     except httpx.TooManyRedirects:
         base["reason"] = "Too many redirects"
         return base
-    except httpx.UnsupportedProtocol:
-        base["reason"] = "Unsupported URL"
-        return base
-    except httpx.InvalidURL:
+    except (httpx.UnsupportedProtocol, httpx.InvalidURL):
         base["reason"] = "Invalid URL"
         return base
     except Exception as e:
